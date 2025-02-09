@@ -65,7 +65,7 @@ impl ContentService {
         let connection_string = env::var("AZURE_STORAGE_CONNECTION_STRING")
             .expect("AZURE_STORAGE_CONNECTION_STRING must be set");
 
-        // Parse the connection string parts into owned strings
+        // Parse connection string
         let account = connection_string
             .split(';')
             .find(|s| s.starts_with("AccountName="))
@@ -83,21 +83,62 @@ impl ContentService {
         // Create the storage URL
         let url = format!("https://{}.blob.core.windows.net", account);
 
-        // Create credentials using owned values
+        // Create credentials
         let credentials = StorageCredentials::access_key(account.clone(), key);
 
-        // Create the blob client
-        let blob_client = BlobServiceClient::new(&url, credentials)
-            .container_client("content-data");
+        // Create the blob service client
+        let blob_service_client = BlobServiceClient::new(&url, credentials);
 
-        // Create container if it doesn't exist
-        match blob_client.create().await {
-            Ok(_) => println!("Container created or already exists"),
-            Err(e) => eprintln!("Warning: Could not create container: {}", e),
+        // Create the container client
+        let container_client = blob_service_client.container_client("content-data");
+
+        // Try to create container with retries
+        let mut retry_count = 0;
+        let max_retries = 3;
+        let mut last_error = None;
+
+        while retry_count < max_retries {
+            println!("Attempting to create/verify container (attempt {})", retry_count + 1);
+
+            match container_client.get_properties().await {
+                Ok(_) => {
+                    println!("Container already exists");
+                    break;
+                }
+                Err(_) => {
+                    match container_client.create()
+                        .public_access(PublicAccess::None)
+                        .await
+                    {
+                        Ok(_) => {
+                            println!("Container created successfully");
+                            break;
+                        }
+                        Err(e) => {
+                            println!("Failed to create container (attempt {}): {}", retry_count + 1, e);
+                            last_error = Some(e);
+                            retry_count += 1;
+                            if retry_count < max_retries {
+                                let delay = std::time::Duration::from_secs(2u64.pow(retry_count as u32));
+                                println!("Waiting {:?} before retry...", delay);
+                                tokio::time::sleep(delay).await;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if retry_count == max_retries {
+            println!("Warning: Could not create/verify container after {} attempts", max_retries);
+            if let Some(e) = last_error {
+                println!("Last error: {}", e);
+            }
+            // Continue anyway - we'll create the container when needed
         }
 
         Ok(Self {
-            blob_client,
+            blob_client: container_client,
             cache: Arc::new(RwLock::new(ContentCache::new())),
             tmdb_api_key,
         })
@@ -107,19 +148,31 @@ impl ContentService {
         let client = reqwest::Client::new();
         let mut all_content = Vec::new();
 
-        // Get trending movies from TMDB
-        let movies_url = format!(
-            "https://api.themoviedb.org/3/trending/movie/week?api_key={}&language=en-US",
-            self.tmdb_api_key
-        );
+        // Create authorization header
+        let auth_header = format!("Bearer {}", self.tmdb_api_key);
 
-        let response = client.get(&movies_url).send().await?;
+        // Get trending movies from TMDB
+        let movies_url = "https://api.themoviedb.org/3/trending/movie/week?language=en-US";
+
+        println!("Fetching trending movies...");
+        let response = client.get(movies_url)
+            .header("Authorization", &auth_header)
+            .header("accept", "application/json")
+            .send()
+            .await?;
+
+        println!("Movies API response status: {}", response.status());
+
         if response.status().is_success() {
             let data: Value = response.json().await?;
             if let Some(results) = data["results"].as_array() {
+                println!("Found {} movies in response", results.len());
                 for movie in results {
-                    let genres = self.get_movie_genres(&client, movie["id"].as_i64().unwrap_or_default()).await?;
-                    let providers = self.get_watch_providers(&client, "movie", movie["id"].as_i64().unwrap_or_default()).await?;
+                    let movie_id = movie["id"].as_i64().unwrap_or_default();
+                    println!("Processing movie ID: {}", movie_id);
+
+                    let genres = self.get_movie_genres(&client, movie_id, &auth_header).await.unwrap_or_default();
+                    let providers = self.get_watch_providers(&client, "movie", movie_id, &auth_header).await.unwrap_or_default();
 
                     let content = Content {
                         title: movie["title"].as_str().unwrap_or_default().to_string(),
@@ -132,24 +185,38 @@ impl ContentService {
                         description: movie["overview"].as_str().unwrap_or_default().to_string(),
                         where_to_watch: providers,
                     };
+                    println!("Added movie: {}", content.title);
                     all_content.push(content);
                 }
             }
+        } else {
+            println!("Failed to get movies. Status: {}", response.status());
+            let error_text = response.text().await?;
+            println!("Error response: {}", error_text);
         }
 
         // Get trending TV shows from TMDB
-        let tv_url = format!(
-            "https://api.themoviedb.org/3/trending/tv/week?api_key={}&language=en-US",
-            self.tmdb_api_key
-        );
+        let tv_url = "https://api.themoviedb.org/3/trending/tv/week?language=en-US";
 
-        let response = client.get(&tv_url).send().await?;
+        println!("Fetching trending TV shows...");
+        let response = client.get(tv_url)
+            .header("Authorization", &auth_header)
+            .header("accept", "application/json")
+            .send()
+            .await?;
+
+        println!("TV API response status: {}", response.status());
+
         if response.status().is_success() {
             let data: Value = response.json().await?;
             if let Some(results) = data["results"].as_array() {
+                println!("Found {} TV shows in response", results.len());
                 for show in results {
-                    let genres = self.get_tv_genres(&client, show["id"].as_i64().unwrap_or_default()).await?;
-                    let providers = self.get_watch_providers(&client, "tv", show["id"].as_i64().unwrap_or_default()).await?;
+                    let show_id = show["id"].as_i64().unwrap_or_default();
+                    println!("Processing TV show ID: {}", show_id);
+
+                    let genres = self.get_tv_genres(&client, show_id, &auth_header).await.unwrap_or_default();
+                    let providers = self.get_watch_providers(&client, "tv", show_id, &auth_header).await.unwrap_or_default();
 
                     let content = Content {
                         title: show["name"].as_str().unwrap_or_default().to_string(),
@@ -162,22 +229,32 @@ impl ContentService {
                         description: show["overview"].as_str().unwrap_or_default().to_string(),
                         where_to_watch: providers,
                     };
+                    println!("Added TV show: {}", content.title);
                     all_content.push(content);
                 }
             }
+        } else {
+            println!("Failed to get TV shows. Status: {}", response.status());
+            let error_text = response.text().await?;
+            println!("Error response: {}", error_text);
         }
 
         println!("Scraped {} items total", all_content.len());
         Ok(all_content)
     }
 
-    async fn get_movie_genres(&self, client: &reqwest::Client, movie_id: i64) -> Result<Vec<String>> {
+    async fn get_movie_genres(&self, client: &reqwest::Client, movie_id: i64, auth_header: &str) -> Result<Vec<String>> {
         let url = format!(
-            "https://api.themoviedb.org/3/movie/{}?api_key={}&language=en-US",
-            movie_id, self.tmdb_api_key
+            "https://api.themoviedb.org/3/movie/{}?language=en-US",
+            movie_id
         );
 
-        let response = client.get(&url).send().await?;
+        let response = client.get(&url)
+            .header("Authorization", auth_header)
+            .header("accept", "application/json")
+            .send()
+            .await?;
+
         let mut genres = Vec::new();
 
         if response.status().is_success() {
@@ -194,13 +271,18 @@ impl ContentService {
         Ok(genres)
     }
 
-    async fn get_tv_genres(&self, client: &reqwest::Client, tv_id: i64) -> Result<Vec<String>> {
+    async fn get_tv_genres(&self, client: &reqwest::Client, tv_id: i64, auth_header: &str) -> Result<Vec<String>> {
         let url = format!(
-            "https://api.themoviedb.org/3/tv/{}?api_key={}&language=en-US",
-            tv_id, self.tmdb_api_key
+            "https://api.themoviedb.org/3/tv/{}?language=en-US",
+            tv_id
         );
 
-        let response = client.get(&url).send().await?;
+        let response = client.get(&url)
+            .header("Authorization", auth_header)
+            .header("accept", "application/json")
+            .send()
+            .await?;
+
         let mut genres = Vec::new();
 
         if response.status().is_success() {
@@ -217,22 +299,30 @@ impl ContentService {
         Ok(genres)
     }
 
-    async fn get_watch_providers(&self, client: &reqwest::Client, media_type: &str, id: i64) -> Result<Vec<String>> {
+    async fn get_watch_providers(&self, client: &reqwest::Client, media_type: &str, id: i64, auth_header: &str) -> Result<Vec<String>> {
         let url = format!(
-            "https://api.themoviedb.org/3/{}/{}/watch/providers?api_key={}",
-            media_type, id, self.tmdb_api_key
+            "https://api.themoviedb.org/3/{}/{}/watch/providers",
+            media_type, id
         );
 
-        let response = client.get(&url).send().await?;
+        let response = client.get(&url)
+            .header("Authorization", auth_header)
+            .header("accept", "application/json")
+            .send()
+            .await?;
+
         let mut providers = Vec::new();
 
         if response.status().is_success() {
             let data: Value = response.json().await?;
-            // Look for US providers first
-            if let Some(results) = data["results"]["US"]["flatrate"].as_array() {
-                for provider in results {
-                    if let Some(name) = provider["provider_name"].as_str() {
-                        providers.push(name.to_string());
+            if let Some(us_data) = data.get("results").and_then(|r| r.get("US")) {
+                for provider_type in ["flatrate", "free"].iter() {
+                    if let Some(provider_list) = us_data.get(provider_type).and_then(|p| p.as_array()) {
+                        for provider in provider_list {
+                            if let Some(name) = provider.get("provider_name").and_then(|n| n.as_str()) {
+                                providers.push(name.to_string());
+                            }
+                        }
                     }
                 }
             }
@@ -273,6 +363,7 @@ impl ContentService {
         Ok(())
     }
 
+    // Modify the get_recommendations method in ContentService to add retry logic and fallback
     async fn get_recommendations(&self, prefs: &UserPreferences) -> Result<Vec<Content>> {
         // First try cache
         {
@@ -288,26 +379,60 @@ impl ContentService {
             }
         }
 
-        // If not in cache, load from blob
+        // If not in cache, try to load from blob with retries
         let blob_client = self.blob_client.blob_client("latest.json.gz");
-        match blob_client.get_properties().await {
-            Ok(_) => {
-                let mut stream = blob_client.get().into_stream();
-                let mut data = Vec::new();
+        let mut retry_count = 0;
+        let max_retries = 3;
 
-                use futures_util::StreamExt;
-                while let Some(chunk) = stream.next().await {
-                    let chunk = chunk?;
-                    let bytes = chunk.data.collect().await?;
-                    data.extend(bytes);
+        while retry_count < max_retries {
+            match blob_client.get_properties().await {
+                Ok(_) => {
+                    let mut stream = blob_client.get().into_stream();
+                    let mut data = Vec::new();
+
+                    use futures_util::StreamExt;
+                    while let Some(chunk) = stream.next().await {
+                        match chunk {
+                            Ok(chunk) => {
+                                let bytes = chunk.data.collect().await?;
+                                data.extend(bytes);
+                            },
+                            Err(e) => {
+                                eprintln!("Error reading chunk: {}", e);
+                                break;
+                            }
+                        }
+                    }
+
+                    if !data.is_empty() {
+                        match self.process_blob_data(&data) {
+                            Ok(content) => return Ok(content.into_iter()
+                                .filter(|c| {
+                                    c.rating.unwrap_or(0.0) >= prefs.minimum_rating &&
+                                        c.genre.iter().any(|g| prefs.favorite_genres.contains(g))
+                                })
+                                .collect()),
+                            Err(e) => eprintln!("Error processing blob data: {}", e)
+                        }
+                    }
+                },
+                Err(e) => {
+                    eprintln!("Failed to load from blob storage (attempt {}): {}", retry_count + 1, e);
                 }
+            }
 
-                let mut decoder = flate2::read::GzDecoder::new(&data[..]);
-                let mut decompressed = String::new();
-                std::io::Read::read_to_string(&mut decoder, &mut decompressed)?;
+            retry_count += 1;
+            if retry_count < max_retries {
+                // Exponential backoff
+                tokio::time::sleep(tokio::time::Duration::from_secs(2u64.pow(retry_count as u32))).await;
+            }
+        }
 
-                let content: Vec<Content> = serde_json::from_str(&decompressed)?;
-
+        // If we couldn't load from blob storage, try to fetch fresh content
+        println!("Blob storage access failed, fetching fresh content...");
+        match self.scrape_content().await {
+            Ok(content) => {
+                // Update cache with fresh content
                 let mut cache = self.cache.write();
                 cache.data.insert("latest".to_string(), content.clone());
                 cache.last_updated = chrono::Utc::now();
@@ -320,10 +445,26 @@ impl ContentService {
                     .collect())
             },
             Err(e) => {
-                eprintln!("Failed to load from blob storage: {}", e);
-                Ok(vec![])
+                eprintln!("Failed to fetch fresh content: {}", e);
+                Ok(vec![]) // Return empty vector as last resort
             }
         }
+    }
+
+    // Add this helper method to ContentService
+    fn process_blob_data(&self, data: &[u8]) -> Result<Vec<Content>> {
+        let mut decoder = flate2::read::GzDecoder::new(data);
+        let mut decompressed = String::new();
+        std::io::Read::read_to_string(&mut decoder, &mut decompressed)?;
+
+        let content: Vec<Content> = serde_json::from_str(&decompressed)?;
+
+        // Update cache
+        let mut cache = self.cache.write();
+        cache.data.insert("latest".to_string(), content.clone());
+        cache.last_updated = chrono::Utc::now();
+
+        Ok(content)
     }
 }
 

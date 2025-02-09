@@ -3,6 +3,30 @@
 version = 4
 
 [[package]]
+name = "Media-Scout"
+version = "0.1.0"
+dependencies = [
+ "actix-web",
+ "anyhow",
+ "azure_core",
+ "azure_identity",
+ "azure_storage",
+ "azure_storage_blobs",
+ "chrono",
+ "dotenv",
+ "flate2",
+ "futures-util",
+ "lazy_static",
+ "parking_lot",
+ "reqwest",
+ "rss",
+ "serde",
+ "serde_json",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "RustyXML"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1450,30 +1474,6 @@ name = "log"
 version = "0.4.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04cbf5b083de1c7e0222a7a51dbfdba1cbe1c6ab0b15e29fff3f6c077fd9cd9f"
-
-[[package]]
-name = "media-scout"
-version = "0.1.0"
-dependencies = [
- "actix-web",
- "anyhow",
- "azure_core",
- "azure_identity",
- "azure_storage",
- "azure_storage_blobs",
- "chrono",
- "dotenv",
- "flate2",
- "futures-util",
- "lazy_static",
- "parking_lot",
- "reqwest",
- "rss",
- "serde",
- "serde_json",
- "tokio",
- "url",
-]
 
 [[package]]
 name = "memchr"
