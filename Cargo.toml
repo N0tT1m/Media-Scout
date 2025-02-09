@@ -1,16 +1,24 @@
 [package]
-name = "Media-Scout"
+name = "media-scout"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
-actix-web = "4.0"
-azure_storage_blob = "0.17"
-tokio = { version = "1.0", features = ["full"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+actix-web = "4.4"
+azure_storage = "0.19"
+azure_storage_blobs = "0.19"
+azure_core = "0.19"
+azure_identity = "0.19"
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
-reqwest = { version = "0.11", features = ["json"] }
 dotenv = "0.15"
-deflate = "1.0"
+flate2 = "1.0"
+futures-util = "0.3"
+parking_lot = "0.12"
+reqwest = { version = "0.11", features = ["json"] }
+rss = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+url = "2.4"
+lazy_static = "1.5.0"
