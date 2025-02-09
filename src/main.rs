@@ -1,3 +1,4 @@
+use futures_util::StreamExt;
 use actix_web::{web, App, HttpResponse, HttpServer};
 use azure_storage_blobs::prelude::*;
 use azure_storage_blobs::prelude::*;
@@ -13,6 +14,7 @@ use dotenv::dotenv;
 use std::io::Write;
 use azure_identity;
 use azure_storage::StorageCredentials;
+use url::Url;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct Content {
@@ -65,76 +67,84 @@ impl ContentService {
         let connection_string = env::var("AZURE_STORAGE_CONNECTION_STRING")
             .expect("AZURE_STORAGE_CONNECTION_STRING must be set");
 
-        // Parse connection string
-        let account = connection_string
-            .split(';')
-            .find(|s| s.starts_with("AccountName="))
-            .and_then(|s| s.split('=').nth(1))
-            .ok_or_else(|| anyhow::anyhow!("AccountName not found in connection string"))?
-            .to_string();
+        println!("Parsing connection string...");
 
-        let key = connection_string
-            .split(';')
-            .find(|s| s.starts_with("AccountKey="))
-            .and_then(|s| s.split('=').nth(1))
-            .ok_or_else(|| anyhow::anyhow!("AccountKey not found in connection string"))?
-            .to_string();
+        // Parse connection string components
+        let mut parts = std::collections::HashMap::new();
+        for part in connection_string.split(';') {
+            if let Some((key, value)) = part.split_once('=') {
+                println!("Found connection string part: {} = {}", key,
+                         if key == "AccountKey" { "***" } else { value });
+                parts.insert(key, value);
+            }
+        }
 
-        // Create the storage URL
-        let url = format!("https://{}.blob.core.windows.net", account);
+        // Extract required values
+        let account = parts.get("AccountName")
+            .ok_or_else(|| anyhow::anyhow!("AccountName not found"))?;
+        let key = parts.get("AccountKey")
+            .ok_or_else(|| anyhow::anyhow!("AccountKey not found"))?;
 
-        // Create credentials
-        let credentials = StorageCredentials::access_key(account.clone(), key);
+        println!("Account: {}", account);
+        println!("Key length: {}", key.len());
 
-        // Create the blob service client
-        let blob_service_client = BlobServiceClient::new(&url, credentials);
+        // Create credentials first
+        let credentials = StorageCredentials::access_key(account.to_string(), key.to_string());
+        println!("Created credentials");
 
-        // Create the container client
-        let container_client = blob_service_client.container_client("content-data");
+        // Create the service client with just the account name
+        let blob_service_client = BlobServiceClient::new(account.to_string(), credentials);
+        println!("Created blob service client");
 
-        // Try to create container with retries
-        let mut retry_count = 0;
-        let max_retries = 3;
-        let mut last_error = None;
+        let container_name = "content-data";
+        let container_client = blob_service_client.container_client(container_name);
+        println!("Created container client for: {}", container_name);
 
-        while retry_count < max_retries {
-            println!("Attempting to create/verify container (attempt {})", retry_count + 1);
+        // Try to list containers first
+        println!("\nListing all containers to test connectivity...");
+        let mut containers = blob_service_client.list_containers()
+            .into_stream();
 
-            match container_client.get_properties().await {
-                Ok(_) => {
-                    println!("Container already exists");
-                    break;
-                }
-                Err(_) => {
-                    match container_client.create()
-                        .public_access(PublicAccess::None)
-                        .await
-                    {
-                        Ok(_) => {
-                            println!("Container created successfully");
-                            break;
-                        }
-                        Err(e) => {
-                            println!("Failed to create container (attempt {}): {}", retry_count + 1, e);
-                            last_error = Some(e);
-                            retry_count += 1;
-                            if retry_count < max_retries {
-                                let delay = std::time::Duration::from_secs(2u64.pow(retry_count as u32));
-                                println!("Waiting {:?} before retry...", delay);
-                                tokio::time::sleep(delay).await;
-                            }
+        let mut found = false;
+        while let Some(container_result) = containers.next().await {
+            match container_result {
+                Ok(response) => {
+                    for container in response.containers {
+                        println!("Found container: {}", container.name);
+                        println!("  Last modified: {}", container.last_modified);
+                        println!("  Public access: {:?}", container.public_access);
+                        println!("  Lease status: {:?}", container.lease_status);
+
+                        if container.name == container_name {
+                            found = true;
+                            println!("Target container already exists");
                         }
                     }
+
+                    if let Some(marker) = response.next_marker {
+                        println!("More containers available, next marker: {}", marker);
+                    }
+                },
+                Err(e) => {
+                    println!("Error listing containers: {}", e);
+                    println!("Full error details: {:?}", e);
                 }
             }
         }
 
-        if retry_count == max_retries {
-            println!("Warning: Could not create/verify container after {} attempts", max_retries);
-            if let Some(e) = last_error {
-                println!("Last error: {}", e);
+        if !found {
+            println!("\nTarget container not found, attempting to create it...");
+            match container_client.create()
+                .public_access(PublicAccess::None)
+                .await
+            {
+                Ok(_) => println!("Container created successfully"),
+                Err(e) => {
+                    println!("Error creating container: {}", e);
+                    println!("Full error details: {:?}", e);
+                    return Err(anyhow::anyhow!("Failed to create container: {}", e));
+                }
             }
-            // Continue anyway - we'll create the container when needed
         }
 
         Ok(Self {
