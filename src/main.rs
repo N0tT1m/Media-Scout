@@ -1,12 +1,13 @@
 use futures_util::StreamExt;
 use actix_web::{web, App, HttpResponse, HttpServer};
+use actix_cors::Cors;
 use azure_storage_blobs::prelude::*;
 use azure_storage_blobs::prelude::*;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio;
 use std::env;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use parking_lot::RwLock;
 use anyhow::Result;
@@ -32,16 +33,44 @@ struct UserPreferences {
     minimum_rating: f32,
 }
 
-// In-memory cache to reduce storage operations
+// Add this new struct for tracking already seen content
+#[derive(Debug)]
+struct ContentTracker {
+    seen_ids: std::collections::HashSet<i64>,
+}
+
+impl ContentTracker {
+    fn new() -> Self {
+        Self {
+            seen_ids: std::collections::HashSet::new(),
+        }
+    }
+
+    fn is_new(&mut self, id: i64) -> bool {
+        self.seen_ids.insert(id)
+    }
+}
+
+// First, modify the ContentCache struct to track used recommendations
 struct ContentCache {
     data: HashMap<String, Vec<Content>>,
+    used_recommendations: HashMap<String, HashSet<String>>, // Track used content by user
     last_updated: chrono::DateTime<chrono::Utc>,
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CacheData {
+    content: Vec<Content>,
+    used_recommendations: HashMap<String, HashSet<String>>,
+    last_updated: chrono::DateTime<chrono::Utc>,
+}
+
 
 impl ContentCache {
     fn new() -> Self {
         Self {
             data: HashMap::new(),
+            used_recommendations: HashMap::new(),
             last_updated: chrono::Utc::now(),
         }
     }
@@ -154,35 +183,32 @@ impl ContentService {
         })
     }
 
-    async fn scrape_content(&self) -> Result<Vec<Content>> {
-        let client = reqwest::Client::new();
-        let mut all_content = Vec::new();
+    async fn fetch_movies(&self, client: &reqwest::Client, auth_header: &str,
+                          tracker: &mut ContentTracker, url: String) -> Result<Vec<Content>> {
+        let mut movies = Vec::new();
 
-        // Create authorization header
-        let auth_header = format!("Bearer {}", self.tmdb_api_key);
-
-        // Get trending movies from TMDB
-        let movies_url = "https://api.themoviedb.org/3/trending/movie/week?language=en-US";
-
-        println!("Fetching trending movies...");
-        let response = client.get(movies_url)
-            .header("Authorization", &auth_header)
+        println!("Fetching movies from: {}", url);
+        let response = client.get(&url)
+            .header("Authorization", auth_header)
             .header("accept", "application/json")
             .send()
             .await?;
 
-        println!("Movies API response status: {}", response.status());
-
         if response.status().is_success() {
             let data: Value = response.json().await?;
             if let Some(results) = data["results"].as_array() {
-                println!("Found {} movies in response", results.len());
                 for movie in results {
                     let movie_id = movie["id"].as_i64().unwrap_or_default();
-                    println!("Processing movie ID: {}", movie_id);
 
-                    let genres = self.get_movie_genres(&client, movie_id, &auth_header).await.unwrap_or_default();
-                    let providers = self.get_watch_providers(&client, "movie", movie_id, &auth_header).await.unwrap_or_default();
+                    // Skip if we've already seen this movie
+                    if !tracker.is_new(movie_id) {
+                        continue;
+                    }
+
+                    let genres = self.get_movie_genres(client, movie_id, auth_header).await
+                        .unwrap_or_default();
+                    let providers = self.get_watch_providers(client, "movie", movie_id, auth_header)
+                        .await.unwrap_or_default();
 
                     let content = Content {
                         title: movie["title"].as_str().unwrap_or_default().to_string(),
@@ -195,38 +221,40 @@ impl ContentService {
                         description: movie["overview"].as_str().unwrap_or_default().to_string(),
                         where_to_watch: providers,
                     };
-                    println!("Added movie: {}", content.title);
-                    all_content.push(content);
+                    movies.push(content);
                 }
             }
-        } else {
-            println!("Failed to get movies. Status: {}", response.status());
-            let error_text = response.text().await?;
-            println!("Error response: {}", error_text);
         }
 
-        // Get trending TV shows from TMDB
-        let tv_url = "https://api.themoviedb.org/3/trending/tv/week?language=en-US";
+        Ok(movies)
+    }
 
-        println!("Fetching trending TV shows...");
-        let response = client.get(tv_url)
-            .header("Authorization", &auth_header)
+    async fn fetch_tv_shows(&self, client: &reqwest::Client, auth_header: &str,
+                            tracker: &mut ContentTracker, url: String) -> Result<Vec<Content>> {
+        let mut shows = Vec::new();
+
+        println!("Fetching TV shows from: {}", url);
+        let response = client.get(&url)
+            .header("Authorization", auth_header)
             .header("accept", "application/json")
             .send()
             .await?;
 
-        println!("TV API response status: {}", response.status());
-
         if response.status().is_success() {
             let data: Value = response.json().await?;
             if let Some(results) = data["results"].as_array() {
-                println!("Found {} TV shows in response", results.len());
                 for show in results {
                     let show_id = show["id"].as_i64().unwrap_or_default();
-                    println!("Processing TV show ID: {}", show_id);
 
-                    let genres = self.get_tv_genres(&client, show_id, &auth_header).await.unwrap_or_default();
-                    let providers = self.get_watch_providers(&client, "tv", show_id, &auth_header).await.unwrap_or_default();
+                    // Skip if we've already seen this show
+                    if !tracker.is_new(show_id) {
+                        continue;
+                    }
+
+                    let genres = self.get_tv_genres(client, show_id, auth_header).await
+                        .unwrap_or_default();
+                    let providers = self.get_watch_providers(client, "tv", show_id, auth_header)
+                        .await.unwrap_or_default();
 
                     let content = Content {
                         title: show["name"].as_str().unwrap_or_default().to_string(),
@@ -239,17 +267,118 @@ impl ContentService {
                         description: show["overview"].as_str().unwrap_or_default().to_string(),
                         where_to_watch: providers,
                     };
-                    println!("Added TV show: {}", content.title);
-                    all_content.push(content);
+                    shows.push(content);
                 }
             }
-        } else {
-            println!("Failed to get TV shows. Status: {}", response.status());
-            let error_text = response.text().await?;
-            println!("Error response: {}", error_text);
         }
 
-        println!("Scraped {} items total", all_content.len());
+        Ok(shows)
+    }
+
+    // Helper function to generate a unique key for each user's preference combination
+    fn generate_user_key(&self, prefs: &UserPreferences) -> String {
+        use std::hash::{Hash, Hasher};
+        use std::collections::hash_map::DefaultHasher;
+
+        let mut hasher = DefaultHasher::new();
+
+        // Sort genres for consistent hashing
+        let mut genres = prefs.favorite_genres.clone();
+        genres.sort();
+
+        // Hash the preferences
+        genres.hash(&mut hasher);
+        prefs.minimum_rating.to_bits().hash(&mut hasher);
+
+        format!("user_{:x}", hasher.finish())
+    }
+
+    // Update the scrape_content method to get even more content
+    async fn scrape_content(&self) -> Result<Vec<Content>> {
+        let client = reqwest::Client::new();
+        let mut all_content = Vec::new();
+        let mut tracker = ContentTracker::new();
+        let auth_header = format!("Bearer {}", self.tmdb_api_key);
+
+        // Increase pages to get more content
+        for page in 1..=5 {  // Increased from 3 to 5 pages
+            // Trending Movies (Week)
+            all_content.extend(
+                self.fetch_movies(&client, &auth_header, &mut tracker,
+                                  format!("https://api.themoviedb.org/3/trending/movie/week?language=en-US&page={}", page)
+                ).await?
+            );
+
+            // Trending Movies (Day)
+            all_content.extend(
+                self.fetch_movies(&client, &auth_header, &mut tracker,
+                                  format!("https://api.themoviedb.org/3/trending/movie/day?language=en-US&page={}", page)
+                ).await?
+            );
+
+            // Popular Movies
+            all_content.extend(
+                self.fetch_movies(&client, &auth_header, &mut tracker,
+                                  format!("https://api.themoviedb.org/3/movie/popular?language=en-US&page={}", page)
+                ).await?
+            );
+
+            // Top Rated Movies
+            all_content.extend(
+                self.fetch_movies(&client, &auth_header, &mut tracker,
+                                  format!("https://api.themoviedb.org/3/movie/top_rated?language=en-US&page={}", page)
+                ).await?
+            );
+
+            // Now Playing Movies
+            all_content.extend(
+                self.fetch_movies(&client, &auth_header, &mut tracker,
+                                  format!("https://api.themoviedb.org/3/movie/now_playing?language=en-US&page={}", page)
+                ).await?
+            );
+
+            // Trending TV Shows (Week)
+            all_content.extend(
+                self.fetch_tv_shows(&client, &auth_header, &mut tracker,
+                                    format!("https://api.themoviedb.org/3/trending/tv/week?language=en-US&page={}", page)
+                ).await?
+            );
+
+            // Trending TV Shows (Day)
+            all_content.extend(
+                self.fetch_tv_shows(&client, &auth_header, &mut tracker,
+                                    format!("https://api.themoviedb.org/3/trending/tv/day?language=en-US&page={}", page)
+                ).await?
+            );
+
+            // Popular TV Shows
+            all_content.extend(
+                self.fetch_tv_shows(&client, &auth_header, &mut tracker,
+                                    format!("https://api.themoviedb.org/3/tv/popular?language=en-US&page={}", page)
+                ).await?
+            );
+
+            // Top Rated TV Shows
+            all_content.extend(
+                self.fetch_tv_shows(&client, &auth_header, &mut tracker,
+                                    format!("https://api.themoviedb.org/3/tv/top_rated?language=en-US&page={}", page)
+                ).await?
+            );
+
+            // Currently Airing TV Shows
+            all_content.extend(
+                self.fetch_tv_shows(&client, &auth_header, &mut tracker,
+                                    format!("https://api.themoviedb.org/3/tv/on_the_air?language=en-US&page={}", page)
+                ).await?
+            );
+        }
+
+        // Shuffle the content for variety
+        use rand::seq::SliceRandom;
+        let mut rng = rand::thread_rng();
+        all_content.shuffle(&mut rng);
+
+        println!("Scraped {} unique items total", all_content.len());
         Ok(all_content)
     }
 
@@ -341,7 +470,200 @@ impl ContentService {
         Ok(providers)
     }
 
+    // async fn update_content(&self) -> Result<()> {
+    //     {
+    //         let cache = self.cache.read();
+    //         if !cache.needs_update() {
+    //             return Ok(());
+    //         }
+    //     }
+    //
+    //     println!("Starting content scraping...");
+    //     let content = self.scrape_content().await?;
+    //     println!("Scraped {} items", content.len());
+    //
+    //     let json = serde_json::to_string(&content)?;
+    //     println!("JSON serialized, size: {} bytes", json.len());
+    //
+    //     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    //     encoder.write_all(json.as_bytes())?;
+    //     let compressed = encoder.finish()?;
+    //     println!("Compressed size: {} bytes", compressed.len());
+    //
+    //     // Create a blob client for our file
+    //     let blob_name = "latest.json.gz";
+    //     let blob_client = self.blob_client.blob_client(blob_name);
+    //
+    //     println!("Attempting to upload blob: {}", blob_name);
+    //
+    //     let mut retry_count = 0;
+    //     let max_retries = 3;
+    //     let mut last_error = None;
+    //
+    //     // Create metadata using standard Headers
+    //     use azure_core::headers::Headers;
+    //     let mut metadata = Headers::new();
+    //     metadata.insert("x-ms-meta-encoding", "gzip");
+    //     metadata.insert("x-ms-meta-items", content.len().to_string());
+    //
+    //     while retry_count < max_retries {
+    //         println!("Upload attempt {} of {}", retry_count + 1, max_retries);
+    //
+    //         match blob_client.put_block_blob(compressed.clone())
+    //             .content_type("application/gzip")
+    //             .metadata(&metadata)
+    //             .await
+    //         {
+    //             Ok(_) => {
+    //                 println!("Successfully uploaded blob: {}", blob_name);
+    //
+    //                 // Verify the upload
+    //                 match blob_client.get_properties().await {
+    //                     Ok(props) => {
+    //                         let size = props.blob.properties.content_length;
+    //                         println!("Verified blob exists with size: {} bytes", size);
+    //
+    //                         // Update cache only after successful upload and verification
+    //                         let mut cache = self.cache.write();
+    //                         cache.data.insert("latest".to_string(), content);
+    //                         cache.last_updated = chrono::Utc::now();
+    //                         println!("Cache updated");
+    //                         return Ok(());
+    //                     },
+    //                     Err(e) => {
+    //                         println!("Warning: Upload appeared successful but verification failed: {}", e);
+    //                         // Continue with retry since verification failed
+    //                     }
+    //                 }
+    //             },
+    //             Err(e) => {
+    //                 println!("Failed to upload blob (attempt {}): {}", retry_count + 1, e);
+    //                 println!("Error details: {:?}", e);
+    //                 last_error = Some(e);
+    //             }
+    //         }
+    //
+    //         retry_count += 1;
+    //         if retry_count < max_retries {
+    //             let delay = std::time::Duration::from_secs(2u64.pow(retry_count as u32));
+    //             println!("Waiting {:?} before retry...", delay);
+    //             tokio::time::sleep(delay).await;
+    //         }
+    //     }
+    //
+    //     if let Some(e) = last_error {
+    //         eprintln!("Failed to upload blob after {} attempts", max_retries);
+    //         eprintln!("Final error: {}", e);
+    //         return Err(anyhow::anyhow!("Failed to upload blob: {}", e));
+    //     }
+    //
+    //     Ok(())
+    // }
+
+    // async fn get_recommendations(&self, prefs: &UserPreferences) -> Result<Vec<Content>> {
+    //     // First try cache
+    //     {
+    //         let cache = self.cache.read();
+    //         if let Some(content) = cache.data.get("latest") {
+    //             println!("Returning recommendations from cache");
+    //             return Ok(content.iter()
+    //                 .filter(|c| {
+    //                     c.rating.unwrap_or(0.0) >= prefs.minimum_rating &&
+    //                         c.genre.iter().any(|g| prefs.favorite_genres.contains(g))
+    //                 })
+    //                 .cloned()
+    //                 .collect());
+    //         }
+    //     }
+    //
+    //     // If not in cache, try to load from blob
+    //     let blob_name = "latest.json.gz";
+    //     let blob_client = self.blob_client.blob_client(blob_name);
+    //
+    //     println!("Checking if blob exists...");
+    //     match blob_client.get_properties().await {
+    //         Ok(props) => {
+    //             println!("Found existing blob, downloading content...");
+    //             let mut stream = blob_client.get().into_stream();
+    //             let mut data = Vec::new();
+    //
+    //             use futures_util::StreamExt;
+    //             while let Some(chunk) = stream.next().await {
+    //                 match chunk {
+    //                     Ok(chunk) => {
+    //                         let bytes = chunk.data.collect().await?;
+    //                         data.extend(bytes);
+    //                     },
+    //                     Err(e) => {
+    //                         println!("Error reading chunk: {}", e);
+    //                         break;
+    //                     }
+    //                 }
+    //             }
+    //
+    //             if !data.is_empty() {
+    //                 println!("Downloaded {} bytes", data.len());
+    //                 match self.process_blob_data(&data) {
+    //                     Ok(content) => {
+    //                         println!("Successfully processed blob data with {} items", content.len());
+    //                         return Ok(content.into_iter()
+    //                             .filter(|c| {
+    //                                 c.rating.unwrap_or(0.0) >= prefs.minimum_rating &&
+    //                                     c.genre.iter().any(|g| prefs.favorite_genres.contains(g))
+    //                             })
+    //                             .collect());
+    //                     },
+    //                     Err(e) => {
+    //                         println!("Error processing blob data: {}, falling back to fresh fetch", e);
+    //                     }
+    //                 }
+    //             } else {
+    //                 println!("Downloaded data was empty, falling back to fresh fetch");
+    //             }
+    //         },
+    //         Err(e) => {
+    //             if e.to_string().contains("404") {
+    //                 println!("No existing blob found (404), will fetch fresh content");
+    //             } else {
+    //                 println!("Error checking blob properties: {}, falling back to fresh fetch", e);
+    //             }
+    //         }
+    //     }
+    //
+    //     // If we couldn't load from blob storage, fetch fresh content
+    //     println!("Starting fresh content fetch...");
+    //     match self.scrape_content().await {
+    //         Ok(content) => {
+    //             println!("Successfully fetched {} items, saving to blob storage...", content.len());
+    //
+    //             // Save the content to blob storage
+    //             if let Err(e) = self.save_to_blob(&content).await {
+    //                 println!("Warning: Failed to save to blob storage: {}", e);
+    //             } else {
+    //                 println!("Successfully saved to blob storage");
+    //             }
+    //
+    //             // Update cache with fresh content
+    //             let mut cache = self.cache.write();
+    //             cache.data.insert("latest".to_string(), content.clone());
+    //             cache.last_updated = chrono::Utc::now();
+    //
+    //             Ok(content.into_iter()
+    //                 .filter(|c| {
+    //                     c.rating.unwrap_or(0.0) >= prefs.minimum_rating &&
+    //                         c.genre.iter().any(|g| prefs.favorite_genres.contains(g))
+    //                 })
+    //                 .collect())
+    //         },
+    //         Err(e) => {
+    //             eprintln!("Failed to fetch fresh content: {}", e);
+    //             Ok(vec![])
+    //         }
+    //     }
+    // }
+
     async fn update_content(&self) -> Result<()> {
+        // Check if update is needed
         {
             let cache = self.cache.read();
             if !cache.needs_update() {
@@ -353,7 +675,28 @@ impl ContentService {
         let content = self.scrape_content().await?;
         println!("Scraped {} items", content.len());
 
-        let json = serde_json::to_string(&content)?;
+        // Create cache data outside the lock
+        let cache_data = {
+            let mut cache = self.cache.write();
+            cache.data.insert("latest".to_string(), content);
+            cache.used_recommendations.clear();
+            cache.last_updated = chrono::Utc::now();
+
+            CacheData {
+                content: cache.data.get("latest").cloned().unwrap_or_default(),
+                used_recommendations: cache.used_recommendations.clone(),
+                last_updated: cache.last_updated,
+            }
+        }; // Lock is dropped here
+
+        // Save to blob after releasing the lock
+        self.save_to_blob(&cache_data).await?;
+
+        Ok(())
+    }
+
+    async fn save_to_blob(&self, cache_data: &CacheData) -> Result<()> {
+        let json = serde_json::to_string(cache_data)?;
         println!("JSON serialized, size: {} bytes", json.len());
 
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
@@ -361,120 +704,177 @@ impl ContentService {
         let compressed = encoder.finish()?;
         println!("Compressed size: {} bytes", compressed.len());
 
-        let blob_client = self.blob_client.blob_client("latest.json.gz");
-        blob_client.put_block_blob(compressed).into_future().await?;
-        println!("Successfully uploaded to blob storage");
+        // Create a blob client for our file
+        let blob_name = "latest.json.gz";
+        let blob_client = self.blob_client.blob_client(blob_name);
 
-        let mut cache = self.cache.write();
-        cache.data.insert("latest".to_string(), content);
-        cache.last_updated = chrono::Utc::now();
-        println!("Cache updated");
+        println!("Attempting to upload blob: {}", blob_name);
+
+        // Create metadata using standard Headers
+        use azure_core::headers::Headers;
+        let mut metadata = Headers::new();
+        metadata.insert("encoding", "gzip");
+        metadata.insert("items", &cache_data.content.len().to_string());
+        metadata.insert("last-updated", &cache_data.last_updated.to_rfc3339());
+
+        // Try to upload with retries
+        let mut retry_count = 0;
+        let max_retries = 3;
+        let mut last_error = None;
+
+        while retry_count < max_retries {
+            match blob_client.put_block_blob(compressed.clone())
+                .content_type("application/gzip")
+                .metadata(&metadata)
+                .await
+            {
+                Ok(_) => {
+                    println!("Successfully uploaded blob: {}", blob_name);
+                    return Ok(());
+                },
+                Err(e) => {
+                    println!("Upload attempt {} failed: {}", retry_count + 1, e);
+                    last_error = Some(e);
+                    retry_count += 1;
+
+                    if retry_count < max_retries {
+                        let delay = std::time::Duration::from_secs(2u64.pow(retry_count as u32));
+                        println!("Waiting {:?} before retry...", delay);
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+            }
+        }
+
+        if let Some(e) = last_error {
+            println!("Failed to upload blob after {} attempts", max_retries);
+            return Err(anyhow::anyhow!("Failed to upload blob after {} attempts: {}", max_retries, e));
+        }
 
         Ok(())
     }
 
-    // Modify the get_recommendations method in ContentService to add retry logic and fallback
-    async fn get_recommendations(&self, prefs: &UserPreferences) -> Result<Vec<Content>> {
-        // First try cache
-        {
-            let cache = self.cache.read();
-            if let Some(content) = cache.data.get("latest") {
-                return Ok(content.iter()
-                    .filter(|c| {
-                        c.rating.unwrap_or(0.0) >= prefs.minimum_rating &&
-                            c.genre.iter().any(|g| prefs.favorite_genres.contains(g))
-                    })
-                    .cloned()
-                    .collect());
-            }
-        }
-
-        // If not in cache, try to load from blob with retries
-        let blob_client = self.blob_client.blob_client("latest.json.gz");
-        let mut retry_count = 0;
-        let max_retries = 3;
-
-        while retry_count < max_retries {
-            match blob_client.get_properties().await {
-                Ok(_) => {
-                    let mut stream = blob_client.get().into_stream();
-                    let mut data = Vec::new();
-
-                    use futures_util::StreamExt;
-                    while let Some(chunk) = stream.next().await {
-                        match chunk {
-                            Ok(chunk) => {
-                                let bytes = chunk.data.collect().await?;
-                                data.extend(bytes);
-                            },
-                            Err(e) => {
-                                eprintln!("Error reading chunk: {}", e);
-                                break;
-                            }
-                        }
-                    }
-
-                    if !data.is_empty() {
-                        match self.process_blob_data(&data) {
-                            Ok(content) => return Ok(content.into_iter()
-                                .filter(|c| {
-                                    c.rating.unwrap_or(0.0) >= prefs.minimum_rating &&
-                                        c.genre.iter().any(|g| prefs.favorite_genres.contains(g))
-                                })
-                                .collect()),
-                            Err(e) => eprintln!("Error processing blob data: {}", e)
-                        }
-                    }
-                },
-                Err(e) => {
-                    eprintln!("Failed to load from blob storage (attempt {}): {}", retry_count + 1, e);
-                }
-            }
-
-            retry_count += 1;
-            if retry_count < max_retries {
-                // Exponential backoff
-                tokio::time::sleep(tokio::time::Duration::from_secs(2u64.pow(retry_count as u32))).await;
-            }
-        }
-
-        // If we couldn't load from blob storage, try to fetch fresh content
-        println!("Blob storage access failed, fetching fresh content...");
-        match self.scrape_content().await {
-            Ok(content) => {
-                // Update cache with fresh content
-                let mut cache = self.cache.write();
-                cache.data.insert("latest".to_string(), content.clone());
-                cache.last_updated = chrono::Utc::now();
-
-                Ok(content.into_iter()
-                    .filter(|c| {
-                        c.rating.unwrap_or(0.0) >= prefs.minimum_rating &&
-                            c.genre.iter().any(|g| prefs.favorite_genres.contains(g))
-                    })
-                    .collect())
-            },
-            Err(e) => {
-                eprintln!("Failed to fetch fresh content: {}", e);
-                Ok(vec![]) // Return empty vector as last resort
-            }
-        }
-    }
-
-    // Add this helper method to ContentService
-    fn process_blob_data(&self, data: &[u8]) -> Result<Vec<Content>> {
+    fn process_blob_data(&self, data: &[u8]) -> Result<CacheData> {
         let mut decoder = flate2::read::GzDecoder::new(data);
         let mut decompressed = String::new();
         std::io::Read::read_to_string(&mut decoder, &mut decompressed)?;
 
-        let content: Vec<Content> = serde_json::from_str(&decompressed)?;
+        let cache_data: CacheData = serde_json::from_str(&decompressed)?;
+        Ok(cache_data)
+    }
 
-        // Update cache
-        let mut cache = self.cache.write();
-        cache.data.insert("latest".to_string(), content.clone());
-        cache.last_updated = chrono::Utc::now();
+    async fn get_recommendations(&self, prefs: &UserPreferences) -> Result<Vec<Content>> {
+        println!("ContentService: Processing recommendation request");
+        let user_key = self.generate_user_key(prefs);
 
-        Ok(content)
+        // Try to load from cache first
+        let content = {
+            let cache = self.cache.read();
+            if !cache.needs_update() {
+                cache.data.get("latest").cloned()
+            } else {
+                None
+            }
+        };
+
+        let recommendations = if let Some(content) = content {
+            // Use cached content
+            self.filter_recommendations(content, prefs, &user_key)?
+        } else {
+            // Fetch fresh content
+            println!("Starting fresh content fetch");
+            let content = self.scrape_content().await?;
+
+            // Update cache
+            {
+                let mut cache = self.cache.write();
+                cache.data.insert("latest".to_string(), content.clone());
+                cache.used_recommendations.clear();
+                cache.last_updated = chrono::Utc::now();
+
+                // Create cache data and drop lock before saving
+                let cache_data = CacheData {
+                    content: cache.data.get("latest").cloned().unwrap_or_default(),
+                    used_recommendations: cache.used_recommendations.clone(),
+                    last_updated: cache.last_updated,
+                };
+                drop(cache);
+
+                // Save to blob outside the lock
+                self.save_to_blob(&cache_data).await?;
+            }
+
+            // Filter recommendations
+            self.filter_recommendations(content, prefs, &user_key)?
+        };
+
+        Ok(recommendations)
+    }
+
+    fn filter_recommendations(&self, content: Vec<Content>, prefs: &UserPreferences, user_key: &str) -> Result<Vec<Content>> {
+        println!("Starting content filtering with {} items", content.len());
+
+        // Filter content before taking the lock
+        let mut available: Vec<_> = content.into_iter()
+            .filter(|c| {
+                c.rating.unwrap_or(0.0) >= prefs.minimum_rating &&
+                    c.genre.iter().any(|g| prefs.favorite_genres.contains(g))
+            })
+            .collect();
+
+        println!("Found {} items matching rating and genre criteria", available.len());
+
+        // Take a write lock only when needed
+        {
+            let mut cache = self.cache.write();
+            let used_recs = cache.used_recommendations
+                .entry(user_key.to_string())
+                .or_insert_with(HashSet::new);
+
+            // Filter out used recommendations
+            available.retain(|c| !used_recs.contains(&c.title));
+            println!("After filtering used recommendations: {} items remain", available.len());
+
+            // Reset if running low
+            if available.len() < 10 {
+                println!("Running low on recommendations, resetting for user");
+                used_recs.clear();
+                drop(cache);
+
+                let cache_read = self.cache.read();
+                if let Some(latest_content) = cache_read.data.get("latest") {
+                    available = latest_content.iter()
+                        .filter(|c| {
+                            c.rating.unwrap_or(0.0) >= prefs.minimum_rating &&
+                                c.genre.iter().any(|g| prefs.favorite_genres.contains(g))
+                        })
+                        .cloned()
+                        .collect();
+                }
+            }
+        }
+
+        // Shuffle and select recommendations
+        use rand::seq::SliceRandom;
+        let mut rng = rand::thread_rng();
+        available.shuffle(&mut rng);
+
+        let recommendations: Vec<_> = available.into_iter().take(20).collect();
+        println!("Selected {} recommendations", recommendations.len());
+
+        // Mark selected items as used
+        {
+            let mut cache = self.cache.write();
+            let used_recs = cache.used_recommendations
+                .entry(user_key.to_string())
+                .or_insert_with(HashSet::new);
+
+            for content in &recommendations {
+                used_recs.insert(content.title.clone());
+            }
+        }
+
+        Ok(recommendations)
     }
 }
 
@@ -482,11 +882,23 @@ async fn get_recommendations(
     prefs: web::Json<UserPreferences>,
     service: web::Data<ContentService>,
 ) -> HttpResponse {
+    println!("Received recommendation request with preferences: {:?}", prefs);
+
     match service.get_recommendations(&prefs).await {
-        Ok(content) => HttpResponse::Ok().json(content),
+        Ok(content) => {
+            println!("Returning {} recommendations to frontend", content.len());
+            // Don't save to blob here since we already did in get_recommendations
+            HttpResponse::Ok()
+                .content_type("application/json")
+                .json(content)
+        },
         Err(e) => {
             eprintln!("Error getting recommendations: {}", e);
-            HttpResponse::InternalServerError().finish()
+            HttpResponse::InternalServerError()
+                .content_type("application/json")
+                .json(json!({
+                    "error": format!("Failed to get recommendations: {}", e)
+                }))
         }
     }
 }
@@ -524,13 +936,19 @@ async fn main() -> Result<()> {
 
     println!("Starting HTTP server on 0.0.0.0:8080");
     HttpServer::new(move || {
+        let cors = Cors::default()
+            .allow_any_origin()
+            .allow_any_method()
+            .allow_any_header()
+            .max_age(3600);
+
         App::new()
+            .wrap(cors)
             .app_data(service.clone())
             .route("/recommendations", web::post().to(get_recommendations))
     })
         .bind("0.0.0.0:8080")?
         .run()
         .await?;
-
     Ok(())
 }
